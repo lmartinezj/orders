@@ -1,6 +1,11 @@
 package com.reactivebbq.orders
 
+import java.util.UUID
+
 import akka.actor.{Actor, ActorLogging, Props}
+import akka.cluster.sharding.ClusterSharding
+import akka.cluster.sharding.ShardRegion.{ExtractEntityId, ExtractShardId}
+
 import scala.concurrent.Future
 import akka.pattern.pipe
 
@@ -20,22 +25,29 @@ object OrderActor {
 
   def props(orderRepository: OrderRepository): Props = Props(new OrderActor(orderRepository))
 
+  val entityIdExtractor: ExtractEntityId = {
+    case Envelope(orderId, command) => (orderId.value.toString, command)
+  }
+  val shardIdExtractor: ExtractShardId = {
+    case Envelope(orderId, _) => Math.abs(orderId.value.toString.hashCode % 30).toString
+  }
 }
 
 class OrderActor(repository: OrderRepository) extends Actor with ActorLogging {
   import context.dispatcher
   import OrderActor._
 
+  private val orderId: OrderId = OrderId(UUID.fromString(context.self.path.name))
 
   override def receive: Receive = {
-    case Envelope(orderId, OpenOrder(server, table)) =>
+    case OpenOrder(server, table) =>
       log.info(s"[$orderId] OpenOrder($server, $table)")
       repository.find(orderId).flatMap {
         case Some(order) => duplicateOrder(orderId)
         case None => openOrder(orderId, server, table)
       } pipeTo sender
 
-    case Envelope(orderId, AddItemToOrder(item)) =>
+    case AddItemToOrder(item) =>
       log.info(s"[$orderId] AddItemToOrder($item)")
       repository
         .find(orderId)
@@ -44,7 +56,7 @@ class OrderActor(repository: OrderRepository) extends Actor with ActorLogging {
         case None => orderNotFound(orderId)
       } pipeTo sender
 
-    case Envelope(orderId, GetOrder()) =>
+    case GetOrder() =>
       log.info(s"[$orderId] GetOrder()")
       repository.find(orderId).flatMap {
         case Some(order) => Future.successful(order)
@@ -74,6 +86,5 @@ class OrderActor(repository: OrderRepository) extends Actor with ActorLogging {
     Future
       .failed(OrderNotFoundException(orderId))
   }
-
 
 }
