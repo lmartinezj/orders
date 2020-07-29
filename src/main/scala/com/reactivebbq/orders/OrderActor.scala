@@ -2,7 +2,7 @@ package com.reactivebbq.orders
 
 import java.util.UUID
 
-import akka.actor.{Actor, ActorLogging, Props}
+import akka.actor.{Actor, ActorLogging, Props, Stash, Status}
 import akka.cluster.sharding.ClusterSharding
 import akka.cluster.sharding.ShardRegion.{ExtractEntityId, ExtractShardId}
 
@@ -23,6 +23,8 @@ object OrderActor {
 
   case class Envelope(orderId: OrderId, command: Command) extends SerializableMessage
 
+  private case class OrderLoaded(order: Option[Order])
+
   def props(orderRepository: OrderRepository): Props = Props(new OrderActor(orderRepository))
 
   val entityIdExtractor: ExtractEntityId = {
@@ -33,35 +35,77 @@ object OrderActor {
   }
 }
 
-class OrderActor(repository: OrderRepository) extends Actor with ActorLogging {
+class OrderActor(repository: OrderRepository) extends Actor with ActorLogging with Stash {
   import context.dispatcher
   import OrderActor._
 
   private val orderId: OrderId = OrderId(UUID.fromString(context.self.path.name))
+  private var state: Option[Order] = None
 
-  override def receive: Receive = {
+  repository.find(orderId).map(OrderLoaded.apply) pipeTo self
+
+  override def receive: Receive = loading
+
+  private def loading: Receive = {
+    case OrderLoaded(order) =>
+      unstashAll()
+      state = order
+      context.become(running)
+
+    case Status.Failure(exception) =>
+      log.error(exception, s"[$orderId] FAILURE: ${exception.getMessage}")
+      throw exception
+
+    case _ => stash()
+  }
+
+  private def running: Receive = {
     case OpenOrder(server, table) =>
       log.info(s"[$orderId] OpenOrder($server, $table)")
-      repository.find(orderId).flatMap {
-        case Some(order) => duplicateOrder(orderId)
-        case None => openOrder(orderId, server, table)
-      } pipeTo sender
+
+      state match {
+        case Some(_) => duplicateOrder(orderId) pipeTo sender
+        case None =>
+          context.become(waiting)
+          openOrder(orderId, server, table).pipeTo(self)(sender())
+      }
 
     case AddItemToOrder(item) =>
       log.info(s"[$orderId] AddItemToOrder($item)")
-      repository
-        .find(orderId)
-        .flatMap {
-        case Some(order) => addItem(order, item)
-        case None => orderNotFound(orderId)
-      } pipeTo sender
+      state match {
+        case Some(order) =>
+          context.become(waiting)
+          addItem(order, item) pipeTo self
+        case None => orderNotFound(orderId).pipeTo(self)(sender())
+      }
 
     case GetOrder() =>
       log.info(s"[$orderId] GetOrder()")
-      repository.find(orderId).flatMap {
-        case Some(order) => Future.successful(order)
-        case None => orderNotFound(orderId)
-      } pipeTo sender
+      state match {
+        case Some(order) => sender ! order
+        case None => orderNotFound(orderId) pipeTo sender
+      }
+  }
+
+  private def waiting: Receive = {
+    case event @ OrderOpened(order) =>
+      state = Some(order)
+      unstashAll()
+      sender ! event
+      context.become(running)
+
+    case event @ ItemAddedToOrder(order) =>
+      state = Some(order)
+      unstashAll()
+      sender ! event
+      context.become(running)
+
+    case failure @ Status.Failure(exception) =>
+      log.error(exception, s"[$orderId] FAILURE: ${exception.getMessage}")
+      sender ! failure
+      throw exception
+
+    case _ => stash()
   }
 
   private def openOrder(orderId: OrderId, server: Server, table: Table): Future[OrderOpened] =  {
